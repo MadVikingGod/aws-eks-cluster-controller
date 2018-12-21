@@ -3,11 +3,11 @@
 # Check https://circleci.com/docs/2.0/language-go/ for more details
 version: 2
 jobs:
-  build:
+  tests:
     docker:
       # specify the version
       - image: circleci/golang:1.11
-      
+      - image: circleci/golang:1.12
       # Specify service dependencies here if necessary
       # CircleCI maintains a library of pre-built images
       # documented at https://circleci.com/docs/2.0/circleci-images/
@@ -21,6 +21,7 @@ jobs:
     environment:
       KUBEBUILDER_CONTROLPLANE_START_TIMEOUT: "60s"
       TESTFLAGS: -p 2
+    parallelism: 4
     steps:
       - checkout
       - run: curl -L -O https://github.com/kubernetes-sigs/kubebuilder/releases/download/v1.0.5/kubebuilder_1.0.5_linux_amd64.tar.gz
@@ -28,5 +29,86 @@ jobs:
       - run: mv kubebuilder_1.0.5_linux_amd64 kubebuilder && sudo mv kubebuilder /usr/local/
       - run: export PATH=$PATH:/usr/local/kubebuilder/bin
       # specify any bash command here prefixed with `run: `
-      - run: go test -v ./pkg/apis/...
-      - run: make
+      - run: go list ./pkg/... | circleci tests split | xargs -n 1 go test
+  deploy:
+    docker:
+      - image: circleci/python:3.7
+    working_directory: /go/src/github.com/awslabs/aws-eks-cluster-controller
+    parallelism: 1
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: 
+          name: get Kustomize
+          command: |
+            curl -O kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/v1.0.11/kustomize_1.0.11_linux_amd64
+            chmod +x kustomize
+            mv kustomize /usr/local/bin/kustomize
+      - run: 
+          name: get kubectl
+          command: |
+            curl -LO https://storage.googleapis.com/kubernetes-release/release/v1.13.0/bin/linux/amd64/kubectl
+            chmod +x ./kubectl
+            sudo mv ./kubectl /usr/local/bin/kubectl
+      - run: 
+          name: Build Docker Images
+          command: |
+            docker build . -t ${REPOSITORY}:latest 
+            docker tag ${REPOSITORY}:latest ${REPOSITORY}:${CIRCLE_SHA1}
+            docker tag ${REPOSITORY}:latest ${REPOSITORY}:${CIRCLE_TAG}
+      - run: 
+          name: Update
+          command: |
+            sed --in-place -e 's@image: .*@image: '"${REPOSITORY}:${CIRCLE_TAG}"'@'  ./config/default/manager_image_patch.yaml
+            sed --in-place -e 's@iam.amazonaws.com/role: .*@iam.amazonaws.com/role: '"${IAMROLEARN}"'@' ./config/default/manager_image_patch.yaml
+      - run: 
+          name: Push Docker Images
+          command: |
+            eval $(aws ecr get-login --region $AWS_DEFAULT_REGION --no-include-email)
+            docker push ${REPOSITORY}:latest 
+            docker push ${REPOSITORY}:${CIRCLE_SHA1}
+            docker push ${REPOSITORY}:${CIRCLE_TAG}
+      - run:  
+          name: Deploy
+          command: |
+            kubectl apply -f config/crds
+            kustomize build config/default | kubectl apply -f -
+  test:
+    docker:
+      - image: circleci/golang:1.11
+    working_directory: /go/src/github.com/awslabs/aws-eks-cluster-controller
+    parallelism: 1
+    steps:
+      - checkout 
+      # - setup_remote_docker
+      - run: env
+      - run: 
+          name: test env
+          command: |
+            env
+            echo ${TEST_VAR}
+      - run: pwd
+      - run: ls ./config/default/
+      - run: 
+          command: |
+            sed --in-place -e 's@image: .*@image: '"${REPOSITORY}:${CIRCLE_TAG}"'@'  ./config/default/manager_image_patch.yaml
+            sed --in-place -e 's@iam.amazonaws.com/role: .*@iam.amazonaws.com/role: '"${IAMROLEARN}"'@' ./config/default/manager_image_patch.yaml
+      - run: cat ./config/default/manager_image_patch.yaml
+workflows:
+  version: 2
+  tests:
+    jobs:
+      - tests
+  deploy:
+    jobs:
+      - deploy:
+          requires:
+            - tests
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^v.*/
+        
+
+
